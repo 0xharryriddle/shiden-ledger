@@ -3,9 +3,12 @@ package main
 import (
 	"context"
 	"crypto/x509"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/hyperledger/fabric-gateway/pkg/client"
@@ -13,6 +16,50 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 )
+
+// NotarizationClient wraps the Fabric Gateway client with notarization-specific methods
+type NotarizationClient struct {
+	gateway  *client.Gateway
+	contract *client.Contract
+	network  *client.Network
+	conn     *grpc.ClientConn
+	stopEvents func()
+}
+
+// Config holds configuration for connecting to the Fabric network
+type Config struct {
+	PeerEndpoint string
+	TLSCertPath  string
+	MSPID        string
+	CertPath     string
+	KeyPath      string
+	Channel      string
+	Chaincode    string
+	Contract     string
+}
+
+// LoadConfigFromEnv loads configuration from environment variables
+func LoadConfigFromEnv() (*Config, error) {
+	cfg := &Config{
+		PeerEndpoint: os.Getenv("FABRIC_PEER_ENDPOINT"),
+		TLSCertPath:  os.Getenv("FABRIC_TLS_CERT_PATH"),
+		MSPID:        os.Getenv("FABRIC_MSP_ID"),
+		CertPath:     os.Getenv("FABRIC_CERT_PATH"),
+		KeyPath:      os.Getenv("FABRIC_KEY_PATH"),
+		Channel:      os.Getenv("FABRIC_CHANNEL"),
+		Chaincode:    os.Getenv("FABRIC_CHAINCODE"),
+		Contract:     os.Getenv("FABRIC_CONTRACT"),
+	}
+
+	// Validate required fields
+	if cfg.PeerEndpoint == "" || cfg.TLSCertPath == "" || cfg.MSPID == "" ||
+		cfg.CertPath == "" || cfg.KeyPath == "" || cfg.Channel == "" ||
+		cfg.Chaincode == "" {
+		return nil, errors.New("missing required environment variables")
+	}
+
+	return cfg, nil
+}
 
 func must(err error) {
 	if err != nil {
