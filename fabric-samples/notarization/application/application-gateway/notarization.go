@@ -19,10 +19,10 @@ import (
 
 // NotarizationClient wraps the Fabric Gateway client with notarization-specific methods
 type NotarizationClient struct {
-	gateway  *client.Gateway
-	contract *client.Contract
-	network  *client.Network
-	conn     *grpc.ClientConn
+	gateway    *client.Gateway
+	contract   *client.Contract
+	network    *client.Network
+	conn       *grpc.ClientConn
 	stopEvents func()
 }
 
@@ -63,13 +63,15 @@ func LoadConfigFromEnv() (*Config, error) {
 
 func must(err error) {
 	if err != nil {
-		log.Fatalf("%v", err)
+		log.Fatalf("Fatal error: %v", err)
 	}
 }
 
 func fileBytes(path string) []byte {
 	b, err := os.ReadFile(path)
-	must(err)
+	if err != nil {
+		log.Fatalf("Failed to read file %s: %v", path, err)
+	}
 	return b
 }
 
@@ -82,37 +84,41 @@ func tlsCredentials(tlsCertPath string) (credentials.TransportCredentials, error
 	return credentials.NewClientTLSFromCert(cp, ""), nil
 }
 
-func newGateway() (*client.Gateway, *grpc.ClientConn, error) {
-	peer := os.Getenv("FABRIC_PEER_ENDPOINT")
-	tlsPath := os.Getenv("FABRIC_TLS_CERT_PATH")
-	mspID := os.Getenv("FABRIC_MSP_ID")
+// NewNotarizationClient creates a new client connected to the Fabric network
+func NewNotarizationClient(cfg *Config) (*NotarizationClient, error) {
+	// Create identity
+	cert, err := identity.CertificateFromPEM(fileBytes(cfg.CertPath))
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse certificate: %w", err)
+	}
 
-	cert, err := identity.CertificateFromPEM(fileBytes(os.Getenv("FABRIC_CERT_PATH")))
+	id, err := identity.NewX509Identity(cfg.MSPID, cert)
 	if err != nil {
-		return nil, nil, err
+		return nil, fmt.Errorf("failed to create identity: %w", err)
 	}
-	id, err := identity.NewX509Identity(mspID, cert)
+
+	pk, err := identity.PrivateKeyFromPEM(fileBytes(cfg.KeyPath))
 	if err != nil {
-		return nil, nil, err
+		return nil, fmt.Errorf("failed to parse private key: %w", err)
 	}
-	pk, err := identity.PrivateKeyFromPEM(fileBytes(os.Getenv("FABRIC_KEY_PATH")))
-	if err != nil {
-		return nil, nil, err
-	}
+
 	sign, err := identity.NewPrivateKeySign(pk)
 	if err != nil {
-		return nil, nil, err
+		return nil, fmt.Errorf("failed to create signer: %w", err)
 	}
 
-	creds, err := tlsCredentials(tlsPath)
+	// Create gRPC connection
+	creds, err := tlsCredentials(cfg.TLSCertPath)
 	if err != nil {
-		return nil, nil, err
-	}
-	conn, err := grpc.Dial(peer, grpc.WithTransportCredentials(creds))
-	if err != nil {
-		return nil, nil, err
+		return nil, fmt.Errorf("failed to create TLS credentials: %w", err)
 	}
 
+	conn, err := grpc.Dial(cfg.PeerEndpoint, grpc.WithTransportCredentials(creds))
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to peer: %w", err)
+	}
+
+	// Create gateway
 	gw, err := client.Connect(id,
 		client.WithClientConnection(conn),
 		client.WithSign(sign),
@@ -121,106 +127,287 @@ func newGateway() (*client.Gateway, *grpc.ClientConn, error) {
 		client.WithSubmitTimeout(30*time.Second),
 		client.WithCommitStatusTimeout(60*time.Second),
 	)
-	return gw, conn, err
-}
-
-func contract(gw *client.Gateway) *client.Contract {
-	channel := os.Getenv("FABRIC_CHANNEL")
-	cc := os.Getenv("FABRIC_CHAINCODE")
-	cn := os.Getenv("FABRIC_CONTRACT")
-	net := gw.GetNetwork(channel)
-	if cn == "" {
-		return net.GetContract(cc)
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("failed to connect to gateway: %w", err)
 	}
-	return net.GetContractWithName(cc, cn)
+
+	// Get network and contract
+	network := gw.GetNetwork(cfg.Channel)
+	var contract *client.Contract
+	if cfg.Contract != "" {
+		contract = network.GetContractWithName(cfg.Chaincode, cfg.Contract)
+	} else {
+		contract = network.GetContract(cfg.Chaincode)
+	}
+
+	// Start event listening
+	stopEvents := startEventListener(network, cfg.Chaincode)
+
+	return &NotarizationClient{
+		gateway:    gw,
+		contract:   contract,
+		network:    network,
+		conn:       conn,
+		stopEvents: stopEvents,
+	}, nil
 }
 
-func PutPII(c *client.Contract, caseID string, piiJSON []byte) error {
+// Close closes the client connection
+func (nc *NotarizationClient) Close() {
+	if nc.stopEvents != nil {
+		nc.stopEvents()
+	}
+	if nc.gateway != nil {
+		nc.gateway.Close()
+	}
+	if nc.conn != nil {
+		nc.conn.Close()
+	}
+}
+
+// startEventListener starts listening to chaincode events
+func startEventListener(network *client.Network, chaincode string) func() {
+	ctx, cancel := context.WithCancel(context.Background())
+	ch, err := network.ChaincodeEvents(ctx, chaincode)
+	if err != nil {
+		log.Printf("Warning: Failed to subscribe to events: %v", err)
+		return cancel
+	}
+
+	go func() {
+		log.Println("Event listener started...")
+		for evt := range ch {
+			log.Printf("📢 Event: %s | TxID: %s | Payload: %s",
+				evt.EventName, evt.TransactionID, string(evt.Payload))
+		}
+		log.Println("Event listener stopped")
+	}()
+
+	return cancel
+}
+
+// PutPII stores personally identifiable information in the private data collection
+func (nc *NotarizationClient) PutPII(caseID string, piiJSON []byte) error {
+	log.Printf("🔐 Storing PII for case: %s", caseID)
+
 	transient := map[string][]byte{"pii": piiJSON}
-	proposal, err := c.NewProposal(
+	proposal, err := nc.contract.NewProposal(
 		"PutPII",
 		client.WithArguments(caseID),
 		client.WithTransient(transient),
 	)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to create PutPII proposal: %w", err)
 	}
+
 	txn, err := proposal.Endorse()
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to endorse PutPII: %w", err)
 	}
+
 	_, err = txn.Submit()
-	return err
-}
-
-func InstrumentIssue(c *client.Contract, payloadJSON []byte, requireMOJ bool) ([]byte, error) {
-	argRequire := "false"
-	if requireMOJ {
-		argRequire = "true"
-	}
-	return c.SubmitTransaction("InstrumentIssue", string(payloadJSON), argRequire)
-}
-
-func InstrumentGet(c *client.Contract, id string) ([]byte, error) {
-	return c.EvaluateTransaction("InstrumentGet", id)
-}
-
-func InstrumentVerify(c *client.Contract, id, docHash string) ([]byte, error) {
-	return c.EvaluateTransaction("InstrumentVerify", id, docHash)
-}
-
-func InstrumentRevoke(c *client.Contract, id, reason string) ([]byte, error) {
-	return c.SubmitTransaction("InstrumentRevoke", id, reason)
-}
-
-func listenEvents(net *client.Network) (stop func()) {
-	ctx, cancel := context.WithCancel(context.Background())
-	ch, err := net.ChaincodeEvents(ctx, os.Getenv("FABRIC_CHAINCODE"))
 	if err != nil {
-		log.Printf("event subscribe err: %v", err)
-		return cancel
+		return fmt.Errorf("failed to submit PutPII: %w", err)
 	}
-	go func() {
-		for evt := range ch {
-			log.Printf("event %s tx=%s payload=%s", evt.EventName, evt.TransactionID, string(evt.Payload))
+
+	log.Printf("✅ PII stored successfully for case: %s", caseID)
+	return nil
+}
+
+// InstrumentIssue creates a new notarization instrument
+func (nc *NotarizationClient) InstrumentIssue(payloadJSON []byte, requireMOJ bool) ([]byte, error) {
+	argRequire := strconv.FormatBool(requireMOJ)
+
+	log.Printf("📋 Issuing instrument (requireMOJ: %v)", requireMOJ)
+
+	result, err := nc.contract.SubmitTransaction("InstrumentIssue", string(payloadJSON), argRequire)
+	if err != nil {
+		return nil, fmt.Errorf("failed to issue instrument: %w", err)
+	}
+
+	log.Printf("✅ Instrument issued successfully")
+	return result, nil
+}
+
+// InstrumentGet retrieves an instrument by ID
+func (nc *NotarizationClient) InstrumentGet(id string) ([]byte, error) {
+	log.Printf("🔍 Getting instrument: %s", id)
+
+	result, err := nc.contract.EvaluateTransaction("InstrumentGet", id)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get instrument %s: %w", id, err)
+	}
+
+	log.Printf("✅ Retrieved instrument: %s", id)
+	return result, nil
+}
+
+// InstrumentVerify verifies an instrument against a document hash
+func (nc *NotarizationClient) InstrumentVerify(id, docHash string) ([]byte, error) {
+	log.Printf("🔐 Verifying instrument %s with hash: %s", id, docHash)
+
+	result, err := nc.contract.EvaluateTransaction("InstrumentVerify", id, docHash)
+	if err != nil {
+		return nil, fmt.Errorf("failed to verify instrument %s: %w", id, err)
+	}
+
+	log.Printf("✅ Verification completed for instrument: %s", id)
+	return result, nil
+}
+
+// InstrumentRevoke revokes an existing instrument
+func (nc *NotarizationClient) InstrumentRevoke(id, reason string) ([]byte, error) {
+	log.Printf("⚠️  Revoking instrument %s, reason: %s", id, reason)
+
+	result, err := nc.contract.SubmitTransaction("InstrumentRevoke", id, reason)
+	if err != nil {
+		return nil, fmt.Errorf("failed to revoke instrument %s: %w", id, err)
+	}
+
+	log.Printf("✅ Instrument revoked: %s", id)
+	return result, nil
+}
+
+// ExampleInstrumentPayload represents a sample instrument payload
+type ExampleInstrumentPayload struct {
+	ID           string      `json:"id"`
+	CaseID       string      `json:"caseId"`
+	InstrumentNo string      `json:"instrumentNo"`
+	Province     string      `json:"province"`
+	Parties      []PartyRef  `json:"parties"`
+	DocHash      string      `json:"docHash"`
+	OffchainURI  string      `json:"offchainUri"`
+	JournalSeq   int         `json:"journalSeq"`
+	QR           string      `json:"qr"`
+	Signatures   []Signature `json:"signatures"`
+}
+
+type PartyRef struct {
+	ID   string `json:"id"`
+	Role string `json:"role"`
+	Name string `json:"name"`
+}
+
+type Signature struct {
+	Subject string `json:"subject"`
+	CertSN  string `json:"certSn"`
+	Algo    string `json:"algo"`
+	Time    string `json:"time"`
+}
+
+func demonstrateNotarizationWorkflow(client *NotarizationClient) error {
+	log.Println("🚀 Starting Notarization Workflow Demonstration")
+
+	// 1. Create example instrument payload
+	payload := ExampleInstrumentPayload{
+		ID:           "INS-2025-0000001",
+		CaseID:       "CASE-2025-0001",
+		InstrumentNo: "2025/VPCC1/0000001",
+		Province:     "79",
+		Parties: []PartyRef{
+			{ID: "P1", Role: "SELLER", Name: "Nguyen A"},
+		},
+		DocHash:     "sha256:abcd1234567890efgh",
+		OffchainURI: "s3://bucket/final.pdf",
+		JournalSeq:  1234,
+		QR:          "INS-2025-0000001",
+		Signatures: []Signature{
+			{
+				Subject: "CCV Nguyen A",
+				CertSN:  "12AB",
+				Algo:    "RSA-PSS",
+				Time:    time.Now().Format(time.RFC3339),
+			},
+		},
+	}
+
+	payloadJSON, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("failed to marshal payload: %w", err)
+	}
+
+	// 2. Issue the instrument
+	log.Println("\n📋 Step 1: Issuing Instrument")
+	result, err := client.InstrumentIssue(payloadJSON, true)
+	if err != nil {
+		return fmt.Errorf("failed to issue instrument: %w", err)
+	}
+	log.Printf("📄 Issued instrument result: %s\n", string(result))
+
+	// 3. Store PII data
+	log.Println("🔐 Step 2: Storing PII Data")
+	pii := map[string]interface{}{
+		"hmacCccd":      "a1b2c3d4e5f6...",
+		"maritalStatus": "married",
+		"phoneNumber":   "+84901234567",
+	}
+	piiJSON, _ := json.Marshal(pii)
+
+	if err := client.PutPII("CASE-2025-0001", piiJSON); err != nil {
+		log.Printf("⚠️  Warning: Failed to store PII: %v", err)
+		// Don't fail the demo for PII errors
+	}
+
+	// 4. Retrieve the instrument
+	log.Println("\n🔍 Step 3: Retrieving Instrument")
+	retrieved, err := client.InstrumentGet("INS-2025-0000001")
+	if err != nil {
+		return fmt.Errorf("failed to get instrument: %w", err)
+	}
+	log.Printf("📄 Retrieved instrument: %s\n", string(retrieved))
+
+	// 5. Verify the instrument
+	log.Println("✅ Step 4: Verifying Instrument")
+	verification, err := client.InstrumentVerify("INS-2025-0000001", "sha256:abcd1234567890efgh")
+	if err != nil {
+		return fmt.Errorf("failed to verify instrument: %w", err)
+	}
+	log.Printf("🔐 Verification result: %s\n", string(verification))
+
+	// 6. Optional: Demonstrate revocation (commented out to not affect the demo)
+	/*
+		log.Println("⚠️  Step 5: Revoking Instrument (Demo)")
+		revoked, err := client.InstrumentRevoke("INS-2025-0000001", "Demo revocation")
+		if err != nil {
+			return fmt.Errorf("failed to revoke instrument: %w", err)
 		}
-	}()
-	return cancel
+		log.Printf("📄 Revoked instrument: %s\n", string(revoked))
+	*/
+
+	log.Println("\n✨ Notarization workflow completed successfully!")
+	return nil
 }
 
 func main() {
-	gw, conn, err := newGateway()
-	must(err)
-	defer conn.Close()
-	defer gw.Close()
+	log.Println("🌟 Notarization Application Gateway Starting...")
 
-	c := contract(gw)
-	stop := listenEvents(gw.GetNetwork(os.Getenv("FABRIC_CHANNEL")))
-	defer stop()
+	// Load configuration
+	cfg, err := LoadConfigFromEnv()
+	if err != nil {
+		log.Fatalf("❌ Configuration error: %v", err)
+	}
 
-	// Example: Issue
-	payload := []byte(`{
-        "id":"INS-2025-0000001",
-        "caseId":"CASE-2025-0001",
-        "instrumentNo":"2025/VPCC1/0000001",
-        "province":"79",
-        "parties":[{"id":"P1","role":"SELLER","name":"Nguyen A"}],
-        "docHash":"sha256:...",
-        "offchainUri":"s3://bucket/final.pdf",
-        "journalSeq":1234,
-        "qr":"INS-2025-0000001",
-        "signatures":[{"subject":"CCV Nguyen A","certSn":"12AB","algo":"RSA-PSS","time":"2025-09-11T09:12:21Z"}]
-    }`)
-	res, err := InstrumentIssue(c, payload, true)
-	must(err)
-	log.Printf("issued: %s", string(res))
+	log.Printf("🔧 Configuration loaded:")
+	log.Printf("   Peer: %s", cfg.PeerEndpoint)
+	log.Printf("   MSP ID: %s", cfg.MSPID)
+	log.Printf("   Channel: %s", cfg.Channel)
+	log.Printf("   Chaincode: %s", cfg.Chaincode)
+	log.Printf("   Contract: %s", cfg.Contract)
 
-	// Example: PutPII (HMAC(CCCD, orgKey) & more)
-	pii := []byte(`{"hmacCccd":"a1b2...","maritalStatus":"married"}`)
-	must(PutPII(c, "CASE-2025-0001", pii))
+	// Create notarization client
+	client, err := NewNotarizationClient(cfg)
+	if err != nil {
+		log.Fatalf("❌ Failed to create client: %v", err)
+	}
+	defer client.Close()
 
-	// Example: Verify
-	ok, err := InstrumentVerify(c, "INS-2025-0000001", "sha256:...")
-	must(err)
-	log.Printf("verify: %s", string(ok))
+	log.Println("✅ Connected to Fabric network successfully!")
+
+	// Run demonstration workflow
+	if err := demonstrateNotarizationWorkflow(client); err != nil {
+		log.Fatalf("❌ Demo failed: %v", err)
+	}
+
+	log.Println("🎉 Application completed successfully!")
 }
