@@ -31,6 +31,3 @@ OrdererOrgs:
       - Hostname: orderer4
         SANS:
           - localhost
-      - Hostname: orderer5
-        SANS:
-          - localhost
