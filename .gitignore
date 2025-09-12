@@ -25,3 +25,5 @@ TESTS*.xml
 .tox/
 .vagrant/
 .vscode
+
+/fabric-samples/
